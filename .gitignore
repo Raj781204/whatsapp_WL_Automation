@@ -1,0 +1,16 @@
+# Secrets & environment files
+.env
+.env.*
+!.env.example
+!env.example
+
+# Virtual environments & Python cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# WhatsApp browser session & runtime data
+wa_chrome_profile/
+debug_open_chat.png
+ip_list.json
