@@ -535,3 +535,35 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def run_aws_from_scraper(json_file=None, login=True, whitelist=True, dry_run=False, ask=False):
+    """Run AWS console login and/or SG whitelisting after WhatsApp + DB save."""
+    global WHITELIST_JSON
+    if json_file:
+        WHITELIST_JSON = str(json_file)
+
+    check_env()
+    try:
+        sts = boto3.client("sts", region_name=REGION)
+        who = sts.get_caller_identity()
+    except (ClientError, BotoCoreError) as e:
+        print(f"AWS: Failure - credentials rejected ({e})")
+        return False
+
+    print(f"AWS credentials valid. Account: {who['Account']}  Identity: {who['Arn']}")
+    if who["Arn"].endswith(":root"):
+        print("AWS: Failure - do not use root access keys.")
+        return False
+
+    login_ok = True
+    if login and not HEADLESS:
+        login_ok = open_console(sts)
+    elif login and HEADLESS:
+        print("HEADLESS=true: skipping browser console open.")
+
+    whitelist_ok = True
+    if whitelist:
+        whitelist_ok = run_whitelist(sts, dry_run=dry_run, ask=ask or ASK_CONFIRM)
+
+    return bool(login_ok and whitelist_ok)
