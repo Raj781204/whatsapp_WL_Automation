@@ -6,6 +6,9 @@ import re
 import time
 import unicodedata
 
+import boto3
+from botocore.exceptions import ClientError
+
 from dotenv import load_dotenv
 import pymysql
 from selenium import webdriver
@@ -27,12 +30,13 @@ from selenium.webdriver.support.ui import WebDriverWait
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-SCRIPT_VERSION = "6.2 (complete file, QR login detection + WhatsApp -> DB -> AWS)"
+SCRIPT_VERSION = "6.3 (Latest-only incoming message detection + single reply)"
 DEBUG = True                          # print every chat message that contains an IP
-LATEST_ONLY = True                    # True = latest message only (all its resources kept)
+LATEST_ONLY = True                   # True = process ONLY the latest message in chat
 TRIGGER_AWS_ON_NEW_DB_ROWS = True     # True = open AWS login/SG step only when inserted > 0
+LAST_MSG_FILE = Path(__file__).resolve().parent / ".last_processed_msg.txt"
 
-CHAT_NAME = "Grafana_Alerts"
+CHAT_NAME = "Abdul Bro CM"
 OUTPUT_FILE = "ip_list.json"
 PROFILE_DIR = "./wa_chrome_profile"   # login is saved here (scan QR once when logged out)
 SCROLL_TIMES = 0                      # 0 = do not scroll back into older history
@@ -54,11 +58,21 @@ FILLER_WORDS = {"PLZ", "PLEASE", "PLS", "WL", "WHITELIST", "FOR", "IP", "IPS"}
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "localhost"),
     "port": int(os.getenv("DB_PORT", "3306")),
-    "user": os.getenv("DB_USER", "raj"),
-    "password": os.getenv("DB_PASSWORD", ""),
+    "user": os.getenv("DB_USER", "Abdul"),
+    "password": os.getenv("DB_PASSWORD", "Abdul@2003"),
     "database": os.getenv("DB_NAME", "whatsapp_db"),
     "charset": "utf8mb4",
 }
+
+# Resource → AWS Security Group mapping
+RESOURCE_TO_SG = {
+    "WH":   "sg-0e46201f9c405d470",   # warehouse
+    "CRM":  "sg-0e77111928e02dfbc",   # crm (launch-wizard-1)
+    "CMOL": "sg-0bd78e962c8d790f5",   # Public-Access-WFH
+}
+
+# boto3 EC2 client (uses env credentials loaded via load_dotenv above)
+ec2 = boto3.client("ec2", region_name=os.getenv("AWS_REGION", "ap-southeast-2"))
 
 SEARCH_SELECTOR = (
     'input[aria-label="Search or start a new chat"], '
@@ -404,6 +418,16 @@ def extract_messages(driver):
 
     seen_texts = set()
     for el in elements:
+        # Skip outgoing messages (sent by us) — only process incoming messages
+        try:
+            is_outgoing = driver.execute_script(
+                "return arguments[0].closest('.message-out') !== null;", el
+            )
+            if is_outgoing:
+                continue
+        except Exception:
+            pass
+
         try:
             text = (el.text or "").strip()
         except StaleElementReferenceException:
@@ -460,12 +484,13 @@ def order_entries(messages):
 # --------------------------------------------------------------------------
 def save_to_db(entries):
     """Insert into ip_addresses (name, resource, port, ip, status) keyed on (ip, resource, port)
-    without wiping existing rows."""
+    without wiping existing rows. Returns (inserted_count, existed_count, newly_inserted_entries)."""
     if not entries:
-        return 0, 0
+        return 0, 0, []
 
     conn = pymysql.connect(**DB_CONFIG)
     inserted = existed = 0
+    newly_inserted = []
     try:
         with conn.cursor() as cur:
             for e in entries:
@@ -480,16 +505,187 @@ def save_to_db(entries):
                 )
                 if cur.rowcount == 1:
                     inserted += 1
+                    e["status"] = "Success"
+                    newly_inserted.append(dict(e))
                 else:
                     existed += 1
-                e["status"] = "Success"
+                    e["status"] = "AlreadyExists"
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    return inserted, existed
+    return inserted, existed, newly_inserted
+
+
+# --------------------------------------------------------------------------
+# AWS Whitelisting (boto3)
+# --------------------------------------------------------------------------
+def whitelist_all(entries):
+    """Whitelist each entry in the correct AWS Security Group and return results."""
+    results = []
+    for e in entries:
+        resource = (e.get("resource") or "").upper()
+        sg_id = RESOURCE_TO_SG.get(resource)
+        ip = e["ip"]
+        port = int(e.get("port") or DEFAULT_PORT)
+        name = e.get("name") or "Unknown"
+        ip_cidr = ip if "/" in ip else f"{ip}/32"
+
+        if not sg_id:
+            print(f"  ⚠️  Unknown resource '{resource}' for {name} — skipping AWS")
+            results.append({**e, "aws_status": "Skipped"})
+            continue
+
+        try:
+            ec2.authorize_security_group_ingress(
+                GroupId=sg_id,
+                IpPermissions=[{
+                    "IpProtocol": "tcp",
+                    "FromPort": port,
+                    "ToPort": port,
+                    "IpRanges": [{"CidrIp": ip_cidr, "Description": f"{name} - {resource}"}],
+                }],
+            )
+            print(f"  ✅ Whitelisted | {name} | {resource} | {ip_cidr}:{port} | SG: {sg_id}")
+            results.append({**e, "aws_status": "Success"})
+        except ClientError as ex:
+            code = ex.response["Error"]["Code"]
+            if code == "InvalidPermission.Duplicate":
+                print(f"  ⚠️  Already exists | {name} | {resource} | {ip_cidr}:{port}")
+                results.append({**e, "aws_status": "Success"})  # already done = success
+            else:
+                print(f"  ❌ AWS Error | {name} | {resource} | {code}: {ex.response['Error']['Message']}")
+                results.append({**e, "aws_status": "Failure"})
+
+    return results
+
+
+# --------------------------------------------------------------------------
+# DB status update after whitelisting
+# --------------------------------------------------------------------------
+def update_db_status(ip, resource, port, status):
+    """Update the status column for a specific (ip, resource, port) row."""
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE `{TABLE_NAME}` SET status = %s "
+                "WHERE ip = %s AND resource = %s AND port = %s",
+                (status, ip, resource, port),
+            )
+        conn.commit()
+    except Exception as ex:
+        print(f"  ⚠️  DB status update failed for {ip}/{resource}: {ex}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# WhatsApp reply after whitelisting
+# --------------------------------------------------------------------------
+def find_input_box(driver):
+    """Locate the WhatsApp message input box using multiple selectors."""
+    selectors = [
+        '#main footer div[contenteditable="true"]',
+        '#main footer div[aria-label="Type a message"]',
+        '#main footer div[data-tab="10"]',
+        'div[contenteditable="true"][aria-label="Type a message"]',
+        'div[contenteditable="true"][data-tab="10"]',
+        '#main div[contenteditable="true"]',
+    ]
+    for sel in selectors:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            visible = [e for e in els if e.is_displayed()]
+            if visible:
+                return visible[0], sel
+        except Exception:
+            continue
+    return None, None
+
+
+def send_single_message(driver, input_box, text):
+    """Type and send a single WhatsApp message reliably without external clipboard tools."""
+    input_box.click()
+    time.sleep(0.5)
+
+    # Clear any leftover draft text first
+    ActionChains(driver).key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).send_keys(Keys.BACKSPACE).perform()
+    time.sleep(0.3)
+
+    # Send text lines using Shift+Enter for line breaks inside the same message
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            input_box.send_keys(line)
+        if i < len(lines) - 1:
+            ActionChains(driver).key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).perform()
+            time.sleep(0.1)
+
+    time.sleep(0.5)
+
+    # Try clicking the official WhatsApp send button if present, else send ENTER
+    sent = False
+    try:
+        send_btn = driver.find_elements(
+            By.CSS_SELECTOR,
+            '#main footer button[aria-label="Send"], #main footer span[data-icon="send"]'
+        )
+        for btn in send_btn:
+            if btn.is_displayed():
+                driver.execute_script("arguments[0].click();", btn)
+                sent = True
+                break
+    except Exception:
+        pass
+
+    if not sent:
+        input_box.send_keys(Keys.ENTER)
+
+    time.sleep(1.5)  # wait between messages so WhatsApp processes each send
+
+
+def send_whatsapp_reply(driver, wait, results):
+    """Send one WhatsApp message per person, grouping all their resources together."""
+    input_box, matched_sel = find_input_box(driver)
+    if not input_box:
+        print("WhatsApp reply failed: could not locate message input box")
+        return
+
+    print(f"  Message input found via: {matched_sel}")
+
+    # Group results by (name, ip) — one message per unique person
+    from collections import OrderedDict
+    grouped = OrderedDict()
+    for r in results:
+        name = r.get("name") or "Unknown"
+        ip   = r.get("ip", "")
+        key  = (name, ip)
+        if key not in grouped:
+            grouped[key] = []
+        grouped[key].append(r)
+
+    # Send one message per person
+    for (name, ip), entries in grouped.items():
+        lines = [f"✅ *{name}* | {ip}"]
+        for r in entries:
+            resource = r.get("resource", "")
+            status   = r.get("aws_status", "Unknown")
+            icon     = "✅" if status == "Success" else ("⚠️" if status == "Skipped" else "❌")
+            lines.append(f"  • {resource} → {icon} {status}")
+
+        msg = "\n".join(lines)
+        try:
+            send_single_message(driver, input_box, msg)
+            print(f"  Sent message for {name}: {lines}")
+        except Exception as ex:
+            print(f"  Failed to send message for {name}: {ex}")
+
+    time.sleep(2)  # final wait to ensure last message is delivered
+    print("WhatsApp: all grouped reply messages sent.")
 
 
 def main():
@@ -518,10 +714,11 @@ def main():
 
         # 1) MySQL
         try:
-            inserted, existed = save_to_db(data)
+            inserted, existed, newly_inserted = save_to_db(data)
             db_ok = True
             print(f"DB: Success - {inserted} new row(s) inserted, {existed} already existed")
         except Exception as e:
+            newly_inserted = []
             for item in data:
                 item["status"] = "Failure"
             print(f"DB: Failure - could not save to the database ({e})")
@@ -544,20 +741,19 @@ def main():
         else:
             print("\nOverall: Failure - nothing was saved. See messages above.")
 
-        # 3) AWS Console Login + Whitelist (only after WhatsApp scrape + DB save when new rows inserted)
-        if TRIGGER_AWS_ON_NEW_DB_ROWS and db_ok and inserted > 0:
-            try:
-                from aws_console_login import run_aws_from_scraper
-                aws_ok = run_aws_from_scraper(
-                    json_file=OUTPUT_FILE,
-                    login=True,
-                    whitelist=True,
-                )
-                print(f"AWS: {'Success' if aws_ok else 'Completed with warnings/failures'}")
-            except Exception as e:
-                print(f"AWS: Failure - could not run AWS step ({e})")
+        # 3) AWS Whitelisting via boto3 (runs ONLY for newly inserted rows)
+        if db_ok and inserted > 0 and newly_inserted:
+            print(f"\nStarting AWS whitelisting for {len(newly_inserted)} new row(s)...")
+            results = whitelist_all(newly_inserted)
+
+            # Update DB status for each result
+            for r in results:
+                update_db_status(r["ip"], r.get("resource", ""), r.get("port", DEFAULT_PORT), r["aws_status"])
+
+            # Send WhatsApp reply summary ONLY for the newly inserted entries
+            send_whatsapp_reply(driver, wait, results)
         elif db_ok:
-            print("AWS: Skipped - no new IP rows inserted into DB.")
+            print("AWS & WhatsApp: Skipped - all entries already exist in DB; no new message to process.")
     except (InvalidSessionIdException, WebDriverException) as e:
         print(f"Browser/WebDriver error: {e}")
     finally:
